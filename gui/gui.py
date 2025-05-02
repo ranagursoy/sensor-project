@@ -1,391 +1,355 @@
+#!/usr/bin/env python3
+"""
+Real-time dual-camera pose viewer + 3-D key-point inspector
+===========================================================
+
+Modules
+-------
+• data_io      – load JSON meta-data
+• mpl_canvas   – lightweight Matplotlib canvas wrapper
+• dialogs      – on-demand 3-D key-point pop-ups
+• video_thread – QThread that handles OpenCV capture & MediaPipe inference
+• start_ui     – simple splash screen for choosing cameras / files
+• main_ui      – side-by-side video playback + 3-D plot + key-point buttons
+
+Run
+---
+$ python pose_viewer.py                # launches GUI
+"""
+
+from __future__ import annotations
 import sys
-import cv2
 import json
+import cv2 as cv
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QWidget,
-                             QScrollArea, QDialog, QTextEdit, QLineEdit, QFileDialog, QGridLayout)
+from typing import Dict, List, Tuple, Optional
+
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import QTimer, QThread, Qt
+from PyQt5.QtWidgets import (
+    QApplication, QDialog, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
+    QWidget, QMainWindow, QLineEdit, QFileDialog, QScrollArea, QTextEdit
+)
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
 import mediapipe as mp
 
-# MediaPipe pose setup
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
 
-# Keypoint names from Mediapipe
-KEYPOINT_NAMES = [
-    "nose", "left_eye_inner", "left_eye", "left_eye_outer", "right_eye_inner", "right_eye", "right_eye_outer",
-    "left_ear", "right_ear", "mouth_left", "mouth_right", "left_shoulder", "right_shoulder", "left_elbow",
-    "right_elbow", "left_wrist", "right_wrist", "left_pinky", "right_pinky", "left_index", "right_index",
-    "left_thumb", "right_thumb", "left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle",
-    "left_heel", "right_heel", "left_foot_index", "right_foot_index"
-]
+# ------------------------------------------------------------------#
+# 1.  Data I/O helpers
+# ------------------------------------------------------------------#
+def load_json(json_path: str) -> Dict:
+    """Return parsed JSON (body-tracking meta-data)."""
+    with open(json_path, encoding="utf-8") as fh:
+        return json.load(fh)
 
-# Load JSON data
-def load_json_data(json_path):
-    with open(json_path, 'r') as f:
-        return json.load(f)
 
+# ------------------------------------------------------------------#
+# 2.  Tiny Matplotlib canvas
+# ------------------------------------------------------------------#
 class MplCanvas(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=4, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = fig.add_subplot(111, projection='3d')
+    """Embed a single 3-D Axes inside a Qt widget."""
+    def __init__(self, w: float = 5, h: float = 4, dpi: int = 100):
+        fig = Figure(figsize=(w, h), dpi=dpi)
+        self.axes = fig.add_subplot(111, projection="3d")
         super().__init__(fig)
 
+
+# ------------------------------------------------------------------#
+# 3.  On-demand 3-D key-point dialog
+# ------------------------------------------------------------------#
 class KeypointDialog(QDialog):
-    def __init__(self, keypoint_name):
+    """
+    Pop-up that shows (x, y, z) of one key-point and a tiny scatter plot.
+    Keeps its own Matplotlib canvas so updates are cheap.
+    """
+    def __init__(self, kp_name: str):
         super().__init__()
-        self.setWindowTitle(f"Keypoint: {keypoint_name}")
-        self.setGeometry(100, 100, 400, 400)
+        self.setWindowTitle(f"Key-point: {kp_name}")
+        self.setFixedSize(400, 400)
 
-        self.keypoint_name = keypoint_name
-        self.x = 0
-        self.y = 0
-        self.z = 0
+        self.canvas = MplCanvas()
+        self.txt = QTextEdit(readOnly=True)
 
-        self.layout = QVBoxLayout()
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.canvas)
+        lay.addWidget(self.txt)
 
-        # 3D plot
-        self.canvas = MplCanvas(self, width=5, height=4, dpi=100)
-        self.layout.addWidget(self.canvas)
-
-        # Coordinates
-        self.coordinates = QTextEdit()
-        self.coordinates.setReadOnly(True)
-        self.layout.addWidget(self.coordinates)
-
-        self.setLayout(self.layout)
-
-    def update_data(self, x, y, z):
-        self.x = x
-        self.y = y
-        self.z = z
-
-        # Update plot
-        self.canvas.axes.clear()
-        self.canvas.axes.scatter(x, y, z, c='blue', label=self.keypoint_name)
-        self.canvas.axes.set_xlabel('X')
-        self.canvas.axes.set_ylabel('Y')
-        self.canvas.axes.set_zlabel('Z')
-        self.canvas.axes.legend()
+    # ---------- public API ----------------------------------------#
+    def update_xyz(self, x: float, y: float, z: float) -> None:
+        """Refresh scatter + text box with new coordinates."""
+        ax = self.canvas.axes
+        ax.clear()
+        ax.scatter([x], [y], [z], c="blue")
+        ax.set(xlabel="X", ylabel="Y", zlabel="Z")
         self.canvas.draw()
+        self.txt.setText(f"X: {x:.2f}  Y: {y:.2f}  Z: {z:.2f}")
 
-        # Update coordinates
-        self.coordinates.setText(f"X: {x}\nY: {y}\nZ: {z}")
 
-class PoseEstimationApp(QMainWindow):
-    def __init__(self, video_path_1, video_path_2, json_path):
-        super().__init__()
-        self.setWindowTitle("Pose Estimation and 3D Keypoint Viewer")
-        self.setGeometry(100, 100, 1200, 800)
+# ------------------------------------------------------------------#
+# 4.  Video / inference worker
+# ------------------------------------------------------------------#
+class VideoWorker(QThread):
+    """
+    Grabs frames from *two* videos (or cameras), runs MediaPipe Pose
+    and emits numpy arrays for display.
+    """
+    frame_ready = pyqtSignal(np.ndarray, np.ndarray)            # half-frames
+    keypoints_ready = pyqtSignal(np.ndarray)                    # (N, 33, 3)
 
-        # Variables for video paths
-        self.video_path_1 = video_path_1
-        self.video_path_2 = video_path_2
-        self.json_path = json_path
+    def __init__(self, src0: str, src1: str, parent=None):
+        super().__init__(parent)
+        self.src0, self.src1 = src0, src1
+        self._stop = False
 
-        # Load JSON data
-        self.json_data = load_json_data(json_path) if json_path else None
-
-        # Start screen layout
-        self.start_screen = QWidget()
-        start_layout = QVBoxLayout()
-
-        # Top-right calibrate button
-        self.calibrate_button = QPushButton("Calibrate")
-        self.calibrate_button.setFixedSize(100, 30)
-        calibrate_layout = QHBoxLayout()
-        calibrate_layout.addStretch()
-        calibrate_layout.addWidget(self.calibrate_button)
-        start_layout.addLayout(calibrate_layout)
-
-        # Pose Estimation label
-        pose_label = QLabel("Pose Estimation")
-        pose_label.setAlignment(Qt.AlignCenter)
-        pose_label.setStyleSheet("font-size: 24px; font-weight: bold;")
-        start_layout.addWidget(pose_label)
-
-        # Live and Record buttons
-        buttons_layout = QHBoxLayout()
-
-        # Live button group
-        live_button = QPushButton("Live")
-        live_button.setFixedSize(100, 30)
-        live_button_layout = QVBoxLayout()
-        live_button_layout.addWidget(live_button)
-
-        # Camera port buttons
-        self.camera_buttons = []
-        for i in range(4):
-            camera_button = QPushButton(f"Camera {i}")
-            camera_button.setFixedSize(100, 30)
-            live_button_layout.addWidget(camera_button)
-            self.camera_buttons.append(camera_button)
-
-        buttons_layout.addLayout(live_button_layout)
-
-        # Record button group
-        record_button = QPushButton("Record")
-        record_button.setFixedSize(100, 30)
-        record_button_layout = QVBoxLayout()
-        record_button_layout.addWidget(record_button)
-
-        # File path inputs
-        self.file_path_1 = QLineEdit()
-        self.file_path_1.setPlaceholderText("Select file 1")
-        self.file_path_1.setFixedSize(200, 30)
-        self.file_path_1.setReadOnly(True)
-        select_file_1 = QPushButton("...")
-        select_file_1.setFixedSize(50, 30)
-        select_file_1.clicked.connect(lambda: self.select_file(self.file_path_1))
-
-        file_layout_1 = QHBoxLayout()
-        file_layout_1.addWidget(self.file_path_1)
-        file_layout_1.addWidget(select_file_1)
-
-        self.file_path_2 = QLineEdit()
-        self.file_path_2.setPlaceholderText("Select file 2")
-        self.file_path_2.setFixedSize(200, 30)
-        self.file_path_2.setReadOnly(True)
-        select_file_2 = QPushButton("...")
-        select_file_2.setFixedSize(50, 30)
-        select_file_2.clicked.connect(lambda: self.select_file(self.file_path_2))
-
-        file_layout_2 = QHBoxLayout()
-        file_layout_2.addWidget(self.file_path_2)
-        file_layout_2.addWidget(select_file_2)
-
-        record_button_layout.addLayout(file_layout_1)
-        record_button_layout.addLayout(file_layout_2)
-
-        buttons_layout.addLayout(record_button_layout)
-
-        start_layout.addLayout(buttons_layout)
-
-        # Start button
-        self.start_button = QPushButton("Start")
-        self.start_button.setFixedSize(200, 50)
-        self.start_button.setStyleSheet("background-color: gray; color: white; font-size: 18px;")
-        self.start_button.setEnabled(False)
-        self.start_button.clicked.connect(self.start_main_application)
-        start_layout.addWidget(self.start_button, alignment=Qt.AlignCenter)
-
-        # Timer for enabling Start button
-        self.enable_start_timer = QTimer()
-        self.enable_start_timer.setSingleShot(True)
-        self.enable_start_timer.timeout.connect(self.enable_start_button)
-
-        # File path change detection
-        self.file_path_1.textChanged.connect(self.check_start_conditions)
-        self.file_path_2.textChanged.connect(self.check_start_conditions)
-
-        self.start_screen.setLayout(start_layout)
-
-        self.setCentralWidget(self.start_screen)
-
-    def select_file(self, line_edit):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "Video Files (*.mp4 *.avi)")
-        if file_path:
-            line_edit.setText(file_path)
-
-    def check_start_conditions(self):
-        if self.file_path_1.text() and self.file_path_2.text():
-            self.enable_start_timer.start(10000)  # 10 seconds delay
-
-    def enable_start_button(self):
-        self.start_button.setStyleSheet("background-color: green; color: white; font-size: 18px;")
-        self.start_button.setEnabled(True)
-
-    def start_main_application(self):
-        video_path_1 = self.file_path_1.text()
-        video_path_2 = self.file_path_2.text()
-        json_path = self.json_path
-        self.hide()
-        self.pose_estimation_window = PoseEstimationMainApp(video_path_1, video_path_2, json_path)
-        self.pose_estimation_window.show()
-
-class PoseEstimationMainApp(QMainWindow):
-    def __init__(self, video_path_1, video_path_2, json_path):
-        super().__init__()
-        self.setWindowTitle("Pose Estimation Viewer")
-        self.setGeometry(100, 100, 1200, 800)
-
-        # Video paths
-        self.video_path_1 = video_path_1
-        self.video_path_2 = video_path_2
-        self.json_data = load_json_data(json_path)
-
-        # Video capture objects
-        self.cap1 = cv2.VideoCapture(self.video_path_1)
-        self.cap2 = cv2.VideoCapture(self.video_path_2)
-
-        if not self.cap1.isOpened() or not self.cap2.isOpened():
-            print("Error: Unable to open videos.")
-            sys.exit()
-
-        # MediaPipe Pose models with high accuracy
-        self.pose_model_1 = mp_pose.Pose(static_image_mode=False, model_complexity=2,
-                                         min_detection_confidence=0.7, min_tracking_confidence=0.7)
-        self.pose_model_2 = mp_pose.Pose(static_image_mode=False, model_complexity=2,
-                                         min_detection_confidence=0.7, min_tracking_confidence=0.7)
-
-        # Main screen
-        self.main_screen = QWidget()
-
-        # Layouts
-        main_layout = QHBoxLayout()
-        video_layout = QVBoxLayout()
-        plot_layout = QVBoxLayout()
-        button_layout = QVBoxLayout()
-
-        # Video labels
-        self.video_label_1 = QLabel("Video 1")
-        self.video_label_2 = QLabel("Video 2")
-        video_layout.addWidget(self.video_label_1)
-        video_layout.addWidget(self.video_label_2)
-
-        # 3D plot setup
-        self.canvas = MplCanvas(self, width=5, height=4, dpi=100)
-        plot_layout.addWidget(self.canvas)
-
-        # Buttons for keypoints
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        button_container = QWidget()
-        self.button_layout = QVBoxLayout()
-        button_container.setLayout(self.button_layout)
-        self.scroll_area.setWidget(button_container)
-        button_layout.addWidget(self.scroll_area)
-
-        main_layout.addLayout(video_layout)
-        main_layout.addLayout(plot_layout)
-        main_layout.addLayout(button_layout)
-        self.main_screen.setLayout(main_layout)
-
-        # Timer for video updates
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frames)
-
-        # Connections for pose keypoints
-        self.connections = [
-            (0, 1), (1, 2), (2, 3), (3, 26), (3, 4), (3, 11), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9),
-            (7, 10), (11, 12), (12, 13), (13, 14), (14, 15), (15, 16), (14, 17), (18, 19),
-            (19, 20), (20, 21), (20, 32), (22, 23), (23, 24), (24, 25), (24, 33), (26, 27), (27, 28), (28, 29),
-            (30, 31), (27, 30), (0, 22), (0, 18)
-        ]
-
-        self.frame_counter = 0
-        self.json_frame_index = 0
-
-        self.keypoint_buttons = []
-        self.keypoint_dialogs = {}
-        self.create_keypoint_buttons()
-
-        self.stacked_layout = QVBoxLayout()
-        self.stacked_layout.addWidget(self.main_screen)
-        self.central_widget = QWidget()
-        self.central_widget.setLayout(self.stacked_layout)
-        self.setCentralWidget(self.central_widget)
-
-        self.start_processing()
-
-    def create_keypoint_buttons(self):
-        for i, name in enumerate(KEYPOINT_NAMES):
-            button = QPushButton(name)
-            button.clicked.connect(lambda checked, kp_index=i: self.open_or_focus_keypoint_dialog(kp_index))
-            self.button_layout.addWidget(button)
-
-    def open_or_focus_keypoint_dialog(self, kp_index):
-        if kp_index not in self.keypoint_dialogs:
-            dialog = KeypointDialog(KEYPOINT_NAMES[kp_index])
-            self.keypoint_dialogs[kp_index] = dialog
-            dialog.show()
-        else:
-            dialog = self.keypoint_dialogs[kp_index]
-            dialog.activateWindow()
-
-    def update_keypoint_dialogs(self):
-        if self.json_data:
-            timestamps = sorted(self.json_data.keys())
-            if self.json_frame_index < len(timestamps):
-                timestamp = timestamps[self.json_frame_index]
-                body_list = self.json_data[timestamp]['body_list']
-                if body_list:
-                    keypoints = np.array(body_list[0]['keypoint'])
-                    for kp_index, dialog in self.keypoint_dialogs.items():
-                        if kp_index < len(keypoints):
-                            x, y, z = keypoints[kp_index]
-                            if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
-                                dialog.update_data(x, y, z)
-
-    def start_processing(self):
-        self.timer.start(300)  # Update every 300 ms (slower playback)
-
-    def update_frames(self):
-        ret1, frame1 = self.cap1.read()
-        ret2, frame2 = self.cap2.read()
-
-        if not ret1 or not ret2 or self.json_frame_index >= len(self.json_data):
-            self.timer.stop()
-            self.cap1.release()
-            self.cap2.release()
+    # ---------- QThread interface --------------------------------#
+    def run(self) -> None:
+        cap0 = cv.VideoCapture(self.src0)
+        cap1 = cv.VideoCapture(self.src1)
+        if not cap0.isOpened() or not cap1.isOpened():
+            print("[ERR] video/camera cannot be opened")
             return
 
-        half_frame1 = frame1[:, :frame1.shape[1] // 2]
-        half_frame2 = frame2[:, frame2.shape[1] // 2:]
+        pose0 = mp.solutions.pose.Pose(model_complexity=2,
+                                       min_detection_confidence=0.7,
+                                       min_tracking_confidence=0.7)
+        pose1 = mp.solutions.pose.Pose(model_complexity=2,
+                                       min_detection_confidence=0.7,
+                                       min_tracking_confidence=0.7)
 
-        result1 = self.pose_model_1.process(cv2.cvtColor(half_frame1, cv2.COLOR_BGR2RGB))
-        result2 = self.pose_model_2.process(cv2.cvtColor(half_frame2, cv2.COLOR_BGR2RGB))
+        while not self._stop:
+            ok0, f0 = cap0.read()
+            ok1, f1 = cap1.read()
+            if not (ok0 and ok1):
+                break
 
-        if result1.pose_landmarks:
-            mp_drawing.draw_landmarks(half_frame1, result1.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            half0 = f0[:, : f0.shape[1] // 2]
+            half1 = f1[:, f1.shape[1] // 2:]
 
-        if result2.pose_landmarks:
-            mp_drawing.draw_landmarks(half_frame2, result2.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            res0 = pose0.process(cv.cvtColor(half0, cv.COLOR_BGR2RGB))
+            res1 = pose1.process(cv.cvtColor(half1, cv.COLOR_BGR2RGB))
 
-        self.display_frame(self.video_label_1, half_frame1)
-        self.display_frame(self.video_label_2, half_frame2)
+            # Draw landmarks for UI (doesn’t affect accuracy)
+            if res0.pose_landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    half0, res0.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+            if res1.pose_landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    half1, res1.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
 
-        self.update_3d_plot()
-        self.update_keypoint_dialogs()
+            stacked_kps = self._landmarks_to_xyz(res0)  # (33,3) or nan
+            self.frame_ready.emit(half0, half1)
+            self.keypoints_ready.emit(stacked_kps)
 
-    def display_frame(self, label, frame):
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = QImage(frame, frame.shape[1], frame.shape[0], QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(image)
-        label.setPixmap(pixmap)
+            self.msleep(30)  # ~33 fps
 
-    def update_3d_plot(self):
+        cap0.release()
+        cap1.release()
+
+    # ---------- helpers ------------------------------------------#
+    @staticmethod
+    def _landmarks_to_xyz(result) -> np.ndarray:
+        """Convert MediaPipe landmarks to (33,3) array or NaNs."""
+        if not result.pose_landmarks:
+            return np.full((33, 3), np.nan, dtype=np.float32)
+
+        lm = result.pose_landmarks.landmark
+        return np.array([[p.x, p.y, p.z] for p in lm], dtype=np.float32)
+
+    # ---------- public API ---------------------------------------#
+    def stop(self) -> None:
+        self._stop = True
+
+
+# ------------------------------------------------------------------#
+# 5.  Main window (viewer)
+# ------------------------------------------------------------------#
+KEYPOINT_NAMES = [
+    "nose", "left_eye_inner", "left_eye", "left_eye_outer", "right_eye_inner",
+    "right_eye", "right_eye_outer", "left_ear", "right_ear", "mouth_left",
+    "mouth_right", "left_shoulder", "right_shoulder", "left_elbow",
+    "right_elbow", "left_wrist", "right_wrist", "left_pinky", "right_pinky",
+    "left_index", "right_index", "left_thumb", "right_thumb", "left_hip",
+    "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle",
+    "left_heel", "right_heel", "left_foot_index", "right_foot_index",
+]
+
+CONNECTIONS = [
+    (0, 11), (0, 12), (11, 13), (13, 15), (12, 14), (14, 16),  # arms
+    (11, 23), (12, 24), (23, 25), (24, 26), (25, 27), (26, 28)  # legs
+]
+
+
+class PoseViewer(QMainWindow):
+    """High-level window that hosts two video panes + 3-D scatter plot."""
+    def __init__(self, src0: str, src1: str, meta_json: Optional[str] = None):
+        super().__init__()
+        self.setWindowTitle("Dual-view Pose Viewer")
+        self.setGeometry(80, 80, 1300, 800)
+
+        # -- left panel: video streams --------------------------------------#
+        self.lbl0 = QLabel(alignment=Qt.AlignCenter)
+        self.lbl1 = QLabel(alignment=Qt.AlignCenter)
+        vid_vbox = QVBoxLayout()
+        vid_vbox.addWidget(self.lbl0)
+        vid_vbox.addWidget(self.lbl1)
+        vid_box = QWidget()
+        vid_box.setLayout(vid_vbox)
+
+        # -- center panel: 3-D Matplotlib plot ------------------------------#
+        self.canvas = MplCanvas(5, 4, 100)
+
+        # -- right panel: scroll-able key-point buttons ---------------------#
+        btn_container = QWidget()
+        btn_lay = QVBoxLayout(btn_container)
+
+        self.btn_dialogs: Dict[int, KeypointDialog] = {}
+        for kpi, name in enumerate(KEYPOINT_NAMES):
+            pb = QPushButton(name)
+            pb.clicked.connect(lambda _, i=kpi: self._toggle_dialog(i))
+            btn_lay.addWidget(pb)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(btn_container)
+
+        # Assemble main h-box
+        root_hbox = QHBoxLayout()
+        root_hbox.addWidget(vid_box, 2)
+        root_hbox.addWidget(self.canvas, 2)
+        root_hbox.addWidget(scroll, 1)
+
+        root = QWidget()
+        root.setLayout(root_hbox)
+        self.setCentralWidget(root)
+
+        # -- background worker ---------------------------------------------#
+        self.worker = VideoWorker(src0, src1)
+        self.worker.frame_ready.connect(self._update_frames)
+        self.worker.keypoints_ready.connect(self._update_plot_and_dialogs)
+        self.worker.start()
+
+        # -- optional JSON meta-data ---------------------------------------#
+        self.meta = load_json(meta_json) if meta_json else None
+        self.frame_idx = 0
+
+    # ---------- slots -----------------------------------------------------#
+    def _update_frames(self, f0: np.ndarray, f1: np.ndarray) -> None:
+        """Convert BGR ndarray → QPixmap and show."""
+        for frame, label in ((f0, self.lbl0), (f1, self.lbl1)):
+            rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                          QImage.Format_RGB888)
+            label.setPixmap(QPixmap.fromImage(qimg))
+
+    def _update_plot_and_dialogs(self, kps: np.ndarray) -> None:
+        """Refresh 3-D scatter + any open key-point dialogs."""
         self.canvas.axes.clear()
-        if self.json_data:
-            timestamps = sorted(self.json_data.keys())
-            timestamp = timestamps[self.json_frame_index]
-            body_list = self.json_data[timestamp]['body_list']
-            for body in body_list:
-                keypoints = np.array(body['keypoint'])
-                if keypoints.size > 0:
-                    x, y, z = keypoints[:, 0], keypoints[:, 1], keypoints[:, 2]
-                    if np.isfinite(x).all() and np.isfinite(y).all() and np.isfinite(z).all():
-                        self.canvas.axes.scatter(x, y, z, c='blue')
-                        for conn in self.connections:
-                            kp1, kp2 = conn
-                            self.canvas.axes.plot([x[kp1], x[kp2]], [y[kp1], y[kp2]], [z[kp1], z[kp2]], color='red')
-        self.canvas.axes.set_xlabel('X')
-        self.canvas.axes.set_ylabel('Y')
-        self.canvas.axes.set_zlabel('Z')
+        if np.isfinite(kps).all():
+            x, y, z = kps.T
+            ax = self.canvas.axes
+            ax.scatter(x, y, z, c="blue")
+            for i, j in CONNECTIONS:
+                ax.plot([x[i], x[j]], [y[i], y[j]], [z[i], z[j]], c="red")
+
         self.canvas.draw()
-        self.json_frame_index += 1
+
+        # Update open dialogs
+        for idx, dlg in self.btn_dialogs.items():
+            if np.isfinite(kps[idx]).all():
+                dlg.update_xyz(*kps[idx])
+
+        # If JSON was supplied, shift index for external data sync
+        self.frame_idx += 1
+
+    # ---------- helpers ---------------------------------------------------#
+    def _toggle_dialog(self, kp_index: int) -> None:
+        """Open or focus the 3-D window for a key-point."""
+        dlg = self.btn_dialogs.get(kp_index)
+        if dlg is None:
+            dlg = KeypointDialog(KEYPOINT_NAMES[kp_index])
+            dlg.show()
+            self.btn_dialogs[kp_index] = dlg
+        else:
+            dlg.activateWindow()
+
+    # ---------- Qt teardown ----------------------------------------------#
+    def closeEvent(self, e) -> None:          # noqa: N802  (Qt override)
+        self.worker.stop()
+        self.worker.wait()
+        super().closeEvent(e)
+
+
+# ------------------------------------------------------------------#
+# 6.  Simple start/splash window
+# ------------------------------------------------------------------#
+class SplashScreen(QWidget):
+    """
+    Minimal splash: choose *two* files (or cameras) then launch viewer.
+    The “Start” button activates after both file fields are populated for
+    5 s – handy if cameras need warm-up.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pose Viewer – Launcher")
+
+        # --- file chooser widgets ----------------------------------------#
+        self.le0, self.le1 = QLineEdit(readOnly=True), QLineEdit(readOnly=True)
+        self.b_choose0 = QPushButton("Browse…")
+        self.b_choose1 = QPushButton("Browse…")
+        self.b_start   = QPushButton("Start", enabled=False)
+
+        self.b_choose0.clicked.connect(lambda: self._select_file(self.le0))
+        self.b_choose1.clicked.connect(lambda: self._select_file(self.le1))
+        self.b_start.clicked.connect(self._launch)
+
+        # --- layout -------------------------------------------------------#
+        row0 = QHBoxLayout(); row0.addWidget(self.le0); row0.addWidget(self.b_choose0)
+        row1 = QHBoxLayout(); row1.addWidget(self.le1); row1.addWidget(self.b_choose1)
+
+        vbox = QVBoxLayout(self)
+        vbox.addLayout(row0)
+        vbox.addLayout(row1)
+        vbox.addWidget(self.b_start, alignment=Qt.AlignCenter)
+
+        # --- timer gates start button after delay ------------------------#
+        self.delay_timer = QTimer(singleShot=True, interval=5000)
+        self.le0.textChanged.connect(self._maybe_enable_timer)
+        self.le1.textChanged.connect(self._maybe_enable_timer)
+        self.delay_timer.timeout.connect(self._enable_start)
+
+    # ---------- internal --------------------------------------------------#
+    def _select_file(self, line_edit: QLineEdit) -> None:
+        fn, _ = QFileDialog.getOpenFileName(self, "Select video / camera",
+                                            "", "Video (*.mp4 *.avi)")
+        if fn:
+            line_edit.setText(fn)
+
+    def _maybe_enable_timer(self) -> None:
+        if self.le0.text() and self.le1.text():
+            self.delay_timer.start()      # fire once after 5s
+
+    def _enable_start(self) -> None:
+        self.b_start.setEnabled(True)
+        self.b_start.setStyleSheet("background:#2c7; color:white;")
+
+    def _launch(self) -> None:
+        self.viewer = PoseViewer(self.le0.text(), self.le1.text())
+        self.viewer.show()
+        self.close()
+
+
+# ------------------------------------------------------------------#
+# 7.  Entry-point
+# ------------------------------------------------------------------#
+def main() -> None:
+    app = QApplication(sys.argv)
+    splash = SplashScreen()
+    splash.show()
+    sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-
-    video_path_1 = ""
-    video_path_2 = ""
-    json_path = ""
-
-    window = PoseEstimationApp(video_path_1, video_path_2, json_path)
-    window.show()
-
-    sys.exit(app.exec_())
+    main()
